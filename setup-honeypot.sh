@@ -357,7 +357,7 @@ NGINX
 # It lives in /var/log/nginx so the distro's existing logrotate covers it.
 if [[ $DRY_RUN -eq 0 && ! -e "$HONEYPOT_LOG" ]]; then
     install -D -m 0640 /dev/null "$HONEYPOT_LOG"
-    id www-data >/dev/null 2>&1 && chown www-data:adm "$HONEYPOT_LOG" 2>/dev/null || true
+    if id www-data >/dev/null 2>&1; then chown www-data:adm "$HONEYPOT_LOG" 2>/dev/null || true; fi
     ok "created $HONEYPOT_LOG"
 fi
 
