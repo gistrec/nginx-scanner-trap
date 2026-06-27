@@ -14,14 +14,19 @@ makes the **first** such request cost the bot its access to the whole host.
 
 ## What it does
 
-- Adds an nginx `log_format` that writes **just the client IP** (http context).
-- `honeypot.conf` — logs probes of sensitive paths (`/.env`, `/.git`, `/.aws`,
-  `/.ssh`, `wp-login.php`, `phpmyadmin`, …) to a dedicated log and returns 404.
-- `deny-dotfiles.conf` — 404 for any other dotfile, kept out of the trap.
-- Wires both snippets into every `server { }` in `sites-enabled/`
-  (idempotent, each file backed up first).
-- Installs and configures **fail2ban**: a filter for the IP-only log and a jail
-  (`maxretry=1`, `nftables-allports`, incremental bans up to a week).
+- Adds an nginx `log_format` that records the client IP, timestamp, and the
+  probed request line (http context) — so you can see *what* was hit.
+- `honeypot.conf` — logs probes of paths a real client never requests (`/.env`,
+  `/.git`, `/.aws`, `/.ssh`, `config.php.bak`, `backup.sql`) to a dedicated log
+  and returns 404. `wp-login.php`/`phpmyadmin` are opt-in via `--aggressive`
+  (they can be legitimate on WordPress/phpMyAdmin hosts).
+- `deny-dotfiles.conf` — 404 for any other dotfile, but keeps
+  `/.well-known/acme-challenge/` working so Let's Encrypt renewals don't break.
+- Wires both snippets into every `server { }` in `sites-enabled/` (idempotent;
+  backups go to `/var/backups/`, with an `nginx -t` rollback on failure).
+- Installs and configures **fail2ban**: a filter for the honeypot log and a jail
+  (`maxretry=1`, `nftables-allports`, incremental bans up to a week), and
+  verifies the jail actually loaded.
 - **Auto-detects your IP** and asks for any extra IPs to whitelist — the ban
   blocks *all* ports (SSH included), so this is what stops you locking yourself
   out.
@@ -57,8 +62,10 @@ curl -fsSL https://raw.githubusercontent.com/gistrec/nginx-scanner-trap/main/set
 |------|---------|
 | `--ip <ip>` | your admin IP (skip auto-detection) |
 | `--extra "<ips>"` | extra IPs/CIDRs to whitelist (space-separated) |
+| `--aggressive` | also trap `wp-login.php` / `phpmyadmin` / `xmlrpc.php` (not for WordPress/phpMyAdmin hosts) |
 | `--no-wire` | don't touch `sites-enabled`; print the include lines instead |
-| `--bantime <sec>` | base ban time (default `86400` = 24h) |
+| `--allow-no-whitelist` | proceed even if no admin IP gets whitelisted (risky) |
+| `--bantime <spec>` | base ban time (default `86400`; accepts `1h`/`1d`/`1w`) |
 | `--maxtime <spec>` | max incremental ban (default `1w`) |
 | `-y, --yes` | assume yes, no prompts |
 | `--dry-run` | show what would happen, change nothing |
@@ -67,17 +74,29 @@ curl -fsSL https://raw.githubusercontent.com/gistrec/nginx-scanner-trap/main/set
 
 - **Idempotent** — re-running won't duplicate includes; managed files are
   rewritten in place.
-- **Backups** — every file it edits is copied to `*.bak.<timestamp>` first.
-- **`nginx -t` with rollback** — if wiring the snippets breaks the config, the
-  site edits are reverted automatically and the script aborts.
-- **Whitelist first** — your IP (auto-detected via `SSH_CONNECTION` →
-  `who am i` → `ss`) plus anything you add, with `127.0.0.1/8 ::1` always in.
-- Leaves an existing `/etc/fail2ban/jail.local` untouched.
+- **Backups outside nginx** — every file it touches is copied under
+  `/var/backups/nginx-scanner-trap/<timestamp>/` (not next to the config, where
+  `include sites-enabled/*` would otherwise load a stray `.bak`).
+- **`nginx -t` with rollback** — if wiring breaks the config, every file the run
+  created or modified is reverted automatically and the script aborts.
+- **Won't lock you out** — your IP (auto-detected via `SSH_CONNECTION` →
+  `who am i` → `ss`) plus anything you add, with `127.0.0.1/8 ::1` always in; it
+  refuses to run with no whitelist unless you pass `--allow-no-whitelist`.
+- Sets only `ignoreip` in `jail.local` `[DEFAULT]` (never changes how other
+  jails such as `sshd` ban), and leaves an existing `jail.local` untouched.
 
 ## Requirements
 
 Debian/Ubuntu, nginx already installed, root. `fail2ban` and `nftables` are
 installed by the script if missing.
+
+## Behind a CDN / reverse proxy
+
+If nginx sits behind Cloudflare or any reverse proxy, configure
+[`real_ip`](https://nginx.org/en/docs/http/ngx_http_realip_module.html)
+(`set_real_ip_from` + `real_ip_header`) **before** enabling the trap — otherwise
+`$remote_addr` is the proxy's IP and fail2ban will ban your proxy/CDN, not the
+scanner.
 
 ## Check / unban
 
