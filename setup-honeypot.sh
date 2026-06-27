@@ -3,10 +3,12 @@
 #
 # What it does (Debian/Ubuntu):
 #   1. Drops a honeypot `log_format` into /etc/nginx/conf.d/ (http context).
-#   2. Writes two server snippets: honeypot.conf (logs scanners of /.env,
-#      /.git, /wp-login.php… → 404) and deny-dotfiles.conf (404 for any /.*).
+#      The log records: client IP, timestamp, and the probed request line.
+#   2. Writes two server snippets: honeypot.conf (logs probes of /.env, /.git,
+#      … → 404) and deny-dotfiles.conf (404 for any other dotfile, but keeps
+#      /.well-known working for Let's Encrypt).
 #   3. Wires both snippets into every server block in sites-enabled
-#      (idempotent, with per-file backups and an `nginx -t` rollback).
+#      (idempotent; backups go OUTSIDE nginx; `nginx -t` rollback on failure).
 #   4. Installs + configures fail2ban: filter, jail (maxretry=1,
 #      nftables-allports, incremental bans) reading the honeypot log.
 #   5. Auto-detects YOUR IP and asks for any extra IPs to whitelist, so the
@@ -16,14 +18,17 @@
 #   sudo bash setup-honeypot.sh                 interactive (recommended)
 #   curl -fsSL https://raw.githubusercontent.com/gistrec/nginx-scanner-trap/main/setup-honeypot.sh | sudo bash
 #
-#   --ip <ip>          your admin IP (skip auto-detection)
-#   --extra "<ips>"    space-separated extra IPs/CIDRs to whitelist
-#   --no-wire          don't touch sites-enabled; just print the include lines
-#   --bantime <sec>    base ban time      (default 86400 = 24h)
-#   --maxtime <spec>   max incremental ban (default 1w)
-#   -y, --yes          assume yes, no prompts (uses detected/--ip + --extra)
-#   --dry-run          show what would happen, change nothing
-#   -h, --help         this help
+#   --ip <ip>            your admin IP (skip auto-detection)
+#   --extra "<ips>"      space-separated extra IPs/CIDRs to whitelist
+#   --aggressive         also trap wp-login.php / phpmyadmin / xmlrpc.php
+#                        (do NOT use if this host runs WordPress/phpMyAdmin)
+#   --no-wire            don't touch sites-enabled; just print the include lines
+#   --allow-no-whitelist proceed even if no admin IP gets whitelisted (risky)
+#   --bantime <spec>     base ban time      (default 86400; accepts 1h/1d/1w)
+#   --maxtime <spec>     max incremental ban (default 1w)
+#   -y, --yes            assume yes, no prompts (uses detected/--ip + --extra)
+#   --dry-run            show what would happen, change nothing
+#   -h, --help           this help
 #
 # Repo:          https://github.com/gistrec/nginx-scanner-trap
 # Write-up:      https://gistrec.cloud/blog/nginx-honeypot-fail2ban/
@@ -41,17 +46,22 @@ F2B_JAIL=/etc/fail2ban/jail.d/nginx-honeypot.conf
 F2B_JAIL_LOCAL=/etc/fail2ban/jail.local
 
 TS=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="/var/backups/nginx-scanner-trap/$TS"
 
 # ── Flags (use ${VAR:-default} so values carried across the sudo re-exec
 #    via the environment are not clobbered on the second run) ─────────────
 ADMIN_IP="${ADMIN_IP:-}"
 EXTRA_IPS="${EXTRA_IPS:-}"
+AGGRESSIVE="${AGGRESSIVE:-0}"
 WIRE="${WIRE:-1}"
+ALLOW_NO_WL="${ALLOW_NO_WL:-0}"
 ASSUME_YES="${ASSUME_YES:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 BANTIME="${BANTIME:-86400}"
 MAXTIME="${MAXTIME:-1w}"
-SITE_BACKUPS=()   # "real|backup" pairs, for rollback
+
+CHANGED=()    # "action|path|backup" records, for nginx rollback
+TMPFILES=()   # mktemp files, cleaned on EXIT
 
 # ── Pretty output ───────────────────────────────────────────────────────
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -68,20 +78,30 @@ step() { printf '\n%s\n' "${C_B}▸ $*${C_0}"; }
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
 
+cleanup() { local t; for t in "${TMPFILES[@]:-}"; do [[ -n "$t" ]] && rm -f "$t"; done; }
+trap cleanup EXIT
+
 # ── Arg parsing ─────────────────────────────────────────────────────────
+need_val() { [[ $# -ge 2 && -n "${2:-}" ]] || { err "Option '$1' requires a value."; exit 2; }; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ip)        ADMIN_IP="${2:-}"; shift 2;;
-        --extra)     EXTRA_IPS="${2:-}"; shift 2;;
-        --no-wire)   WIRE=0; shift;;
-        --bantime)   BANTIME="${2:-}"; shift 2;;
-        --maxtime)   MAXTIME="${2:-}"; shift 2;;
-        -y|--yes)    ASSUME_YES=1; shift;;
-        --dry-run)   DRY_RUN=1; shift;;
-        -h|--help)   usage; exit 0;;
+        --ip)                 need_val "$@"; ADMIN_IP="$2"; shift 2;;
+        --extra)              need_val "$@"; EXTRA_IPS="$2"; shift 2;;
+        --aggressive)         AGGRESSIVE=1; shift;;
+        --no-wire)            WIRE=0; shift;;
+        --allow-no-whitelist) ALLOW_NO_WL=1; shift;;
+        --bantime)            need_val "$@"; BANTIME="$2"; shift 2;;
+        --maxtime)            need_val "$@"; MAXTIME="$2"; shift 2;;
+        -y|--yes)             ASSUME_YES=1; shift;;
+        --dry-run)            DRY_RUN=1; shift;;
+        -h|--help)            usage; exit 0;;
         *) err "Unknown option: $1"; echo "Run '$0 --help' for usage." >&2; exit 2;;
     esac
 done
+
+valid_time() { [[ "$1" =~ ^[0-9]+([smhdwy])?$ ]]; }
+valid_time "$BANTIME" || { err "--bantime '$BANTIME' is not a valid time (e.g. 86400, 1h, 1d, 1w)."; exit 2; }
+valid_time "$MAXTIME" || { err "--maxtime '$MAXTIME' is not a valid time (e.g. 86400, 1h, 1d, 1w)."; exit 2; }
 
 # ── Detect admin IP BEFORE sudo strips the environment ──────────────────
 detect_admin_ip() {
@@ -96,7 +116,7 @@ detect_admin_ip() {
     fi
     if [[ -z "$ip" ]] && command -v ss >/dev/null 2>&1; then
         ip=$(ss -tnHo state established 2>/dev/null \
-             | awk '$1 ~ /ssh|:22$/ || $0 ~ /:22 /{print $4}' \
+             | awk '$0 ~ /:22 /{print $4}' \
              | sed -E 's/.*:([0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]+$/\1/; s/[][]//g' \
              | head -n1)
     fi
@@ -114,22 +134,31 @@ if [[ $EUID -ne 0 ]]; then
     fi
     info "Re-running with sudo…"
     exec sudo --preserve-env=SSH_CONNECTION,SSH_CLIENT \
-        ADMIN_IP="$ADMIN_IP" EXTRA_IPS="$EXTRA_IPS" WIRE="$WIRE" \
-        ASSUME_YES="$ASSUME_YES" DRY_RUN="$DRY_RUN" \
-        BANTIME="$BANTIME" MAXTIME="$MAXTIME" NO_COLOR="${NO_COLOR:-}" \
-        bash "$0" "$@"
+        ADMIN_IP="$ADMIN_IP" EXTRA_IPS="$EXTRA_IPS" AGGRESSIVE="$AGGRESSIVE" \
+        WIRE="$WIRE" ALLOW_NO_WL="$ALLOW_NO_WL" ASSUME_YES="$ASSUME_YES" \
+        DRY_RUN="$DRY_RUN" BANTIME="$BANTIME" MAXTIME="$MAXTIME" \
+        NO_COLOR="${NO_COLOR:-}" bash "$0" "$@"
 fi
+
+# ── Terminal & python availability ──────────────────────────────────────
+if (: </dev/tty) 2>/dev/null; then HAVE_TTY=1; else HAVE_TTY=0; fi
+if [[ $ASSUME_YES -eq 0 && $HAVE_TTY -eq 0 ]]; then
+    err "No terminal available for prompts. Re-run with -y (and --ip/--extra) for non-interactive use."
+    exit 2
+fi
+_PYOK=""; command -v python3 >/dev/null 2>&1 && _PYOK=1
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 run() { if [[ $DRY_RUN -eq 1 ]]; then info "[dry-run] $*"; else "$@"; fi; }
 
 ask() {  # $1 = prompt → echoes the typed answer (reads the real terminal)
     local ans=""
-    if [[ -e /dev/tty ]]; then read -r -p "$1" ans </dev/tty || ans=""; fi
+    [[ $HAVE_TTY -eq 1 ]] && { read -r -p "$1" ans </dev/tty || ans=""; }
     printf '%s' "$ans"
 }
 confirm() {  # $1 = prompt → 0 if yes (default yes)
     [[ $ASSUME_YES -eq 1 ]] && return 0
+    [[ $HAVE_TTY -eq 1 ]] || return 1
     local ans; ans=$(ask "$1 [Y/n] ")
     [[ -z "$ans" || "$ans" =~ ^[Yy] ]]
 }
@@ -138,33 +167,50 @@ valid_ipv4() {
     local ip="$1" pfx="" o
     if [[ "$ip" == */* ]]; then
         pfx="${ip#*/}"; ip="${ip%/*}"
-        [[ "$pfx" =~ ^[0-9]+$ ]] && (( pfx >= 0 && pfx <= 32 )) || return 1
+        [[ "$pfx" =~ ^[0-9]+$ ]] && (( 10#$pfx >= 0 && 10#$pfx <= 32 )) || return 1
     fi
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     local oc; IFS=. read -ra oc <<<"$ip"
-    for o in "${oc[@]}"; do [[ "$o" =~ ^[0-9]+$ ]] && (( o >= 0 && o <= 255 )) || return 1; done
+    for o in "${oc[@]}"; do [[ "$o" =~ ^[0-9]+$ ]] && (( 10#$o >= 0 && 10#$o <= 255 )) || return 1; done
     return 0
 }
-valid_ip() {  # IPv4, IPv4/CIDR, or (loosely) IPv6
-    valid_ipv4 "$1" && return 0
-    [[ "$1" == *:* && "$1" =~ ^[0-9a-fA-F:/]+$ ]] && return 0
+valid_ip() {  # authoritative via python3 if present, else a bash fallback
+    local x="$1"
+    if [[ -n "$_PYOK" ]]; then
+        printf '%s' "$x" | python3 -c 'import sys, ipaddress
+try:
+    ipaddress.ip_network(sys.stdin.read().strip(), strict=False)
+except ValueError:
+    sys.exit(1)' 2>/dev/null
+        return $?
+    fi
+    valid_ipv4 "$x" && return 0
+    [[ "$x" == *:* && "$x" =~ ^[0-9a-fA-F:/]+$ ]] && return 0
     return 1
+}
+
+REPLY_BACKUP=""
+do_backup() {  # $1 = existing file → copy under BACKUP_DIR, set REPLY_BACKUP
+    local b="$BACKUP_DIR$1"
+    mkdir -p "$(dirname "$b")"
+    cp -a "$1" "$b"
+    REPLY_BACKUP="$b"
 }
 
 write_file() {  # $1 = path, $2 = mode; content on stdin
     local path="$1" mode="${2:-0644}" tmp
-    tmp=$(mktemp)
+    tmp=$(mktemp); TMPFILES+=("$tmp")
     cat >"$tmp"
     if [[ $DRY_RUN -eq 1 ]]; then
-        info "[dry-run] would write ${C_B}$path${C_0}:"
-        sed 's/^/      /' "$tmp"; rm -f "$tmp"; return 0
+        info "[dry-run] would write ${C_B}$path${C_0}:"; sed 's/^/      /' "$tmp"; return 0
     fi
-    if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
-        info "unchanged: $path"; rm -f "$tmp"; return 0
+    if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then info "unchanged: $path"; return 0; fi
+    if [[ -e "$path" ]]; then
+        do_backup "$path"; CHANGED+=("modified|$path|$REPLY_BACKUP"); info "backup → $REPLY_BACKUP"
+    else
+        CHANGED+=("created|$path|")
     fi
-    [[ -f "$path" ]] && { cp -a "$path" "$path.bak.$TS"; info "backup → $path.bak.$TS"; }
     install -D -m "$mode" "$tmp" "$path"
-    rm -f "$tmp"
     ok "wrote $path"
 }
 
@@ -173,9 +219,7 @@ ensure_pkg() {  # $1 = package, $2 = binary to probe (optional)
     if command -v "$bin" >/dev/null 2>&1 || dpkg -s "$pkg" >/dev/null 2>&1; then
         info "present: $pkg"; return 0
     fi
-    info "installing: $pkg"
-    run apt-get update -qq
-    run apt-get install -y -qq "$pkg"
+    info "installing: $pkg"; run apt-get update -qq; run apt-get install -y -qq "$pkg"
 }
 
 # ── Preconditions ───────────────────────────────────────────────────────
@@ -183,17 +227,20 @@ step "Checks"
 command -v nginx >/dev/null 2>&1 || { err "nginx not found — install/configure nginx first."; exit 1; }
 command -v apt-get >/dev/null 2>&1 || { err "apt-get not found — this script targets Debian/Ubuntu."; exit 1; }
 ok "nginx and apt-get present"
+warn "If this nginx is behind Cloudflare or a reverse proxy, configure real_ip"
+warn "(set_real_ip_from + real_ip_header) FIRST — otherwise the honeypot records"
+warn "the proxy's IP and fail2ban will ban your proxy/CDN, not the scanner."
 
 # ── Build the whitelist ─────────────────────────────────────────────────
-step "Whitelist (so the ban never locks you out — it blocks ALL ports, SSH too)"
+step "Whitelist (the ban blocks ALL ports, SSH too — don't lock yourself out)"
 
 if [[ -n "$ADMIN_IP" ]]; then
     info "Detected your IP: ${C_B}$ADMIN_IP${C_0}"
-    if ! confirm "Whitelist this IP?"; then ADMIN_IP=""; fi
+    confirm "Whitelist this IP?" || ADMIN_IP=""
 else
     warn "Could not auto-detect your IP."
 fi
-if [[ -z "$ADMIN_IP" && $ASSUME_YES -eq 0 ]]; then
+if [[ -z "$ADMIN_IP" && $ASSUME_YES -eq 0 && $HAVE_TTY -eq 1 ]]; then
     while :; do
         ADMIN_IP=$(ask "Enter your admin IP (or leave empty to skip): ")
         [[ -z "$ADMIN_IP" ]] && break
@@ -201,34 +248,46 @@ if [[ -z "$ADMIN_IP" && $ASSUME_YES -eq 0 ]]; then
         warn "Not a valid IP/CIDR: $ADMIN_IP"
     done
 fi
-
-if [[ $ASSUME_YES -eq 0 ]]; then
+if [[ $ASSUME_YES -eq 0 && $HAVE_TTY -eq 1 ]]; then
     extra_in=$(ask "Extra IPs/CIDRs to whitelist (space-separated, empty = none): ")
     EXTRA_IPS="${EXTRA_IPS:+$EXTRA_IPS }$extra_in"
 fi
 
-# Validate everything; start from localhost, which must always be allowed.
 IGNORE_LIST=(127.0.0.1/8 ::1)
+admin_count=0
 for cand in $ADMIN_IP $EXTRA_IPS; do
     [[ -z "$cand" ]] && continue
-    if valid_ip "$cand"; then IGNORE_LIST+=("$cand"); else warn "skipping invalid: $cand"; fi
+    if valid_ip "$cand"; then IGNORE_LIST+=("$cand"); admin_count=$((admin_count + 1))
+    else warn "skipping invalid: $cand"; fi
 done
-# de-duplicate, preserve order
 IGNOREIP=$(printf '%s\n' "${IGNORE_LIST[@]}" | awk '!seen[$0]++' | paste -sd' ' -)
+
+if [[ $admin_count -eq 0 ]]; then
+    warn "No admin IP will be whitelisted — fail2ban bans on ALL ports, so the"
+    warn "first probe from your own network would lock you out (SSH included)."
+    if [[ $ALLOW_NO_WL -eq 1 ]]; then
+        warn "Proceeding anyway (--allow-no-whitelist)."
+    elif [[ $ASSUME_YES -eq 1 ]]; then
+        err "Refusing to run with no whitelist in -y mode. Pass --ip <ip> or --allow-no-whitelist."
+        exit 2
+    elif ! confirm "Proceed with NO admin IP whitelisted?"; then
+        info "Aborted."; exit 0
+    fi
+fi
 ok "ignoreip = ${C_B}$IGNOREIP${C_0}"
 
 # ── Plan / confirm ──────────────────────────────────────────────────────
 step "Plan"
 cat <<PLAN
-  nginx log format : $CONFD_LOG
-  nginx snippets   : $SNIP_HONEYPOT
+  nginx log format : $CONFD_LOG   (IP, time, request)
+  nginx snippets   : $SNIP_HONEYPOT$([[ $AGGRESSIVE -eq 1 ]] && echo "  [+aggressive]")
                      $SNIP_DENY
   honeypot log     : $HONEYPOT_LOG
   wire into sites  : $([[ $WIRE -eq 1 ]] && echo "yes ($SITES_DIR/*)" || echo "no (manual)")
-  fail2ban filter  : $F2B_FILTER
   fail2ban jail    : $F2B_JAIL  (maxretry=1, bantime=$BANTIME, max=$MAXTIME)
   ban backend      : nftables-allports (all ports)
   whitelist        : $IGNOREIP
+  backups          : $BACKUP_DIR
 PLAN
 [[ $DRY_RUN -eq 1 ]] && warn "DRY RUN — nothing will be changed."
 confirm "Proceed?" || { info "Aborted."; exit 0; }
@@ -242,72 +301,107 @@ ensure_pkg nftables nft
 step "nginx config"
 
 write_file "$CONFD_LOG" 0644 <<'NGINX'
-# Honeypot access log: one IP per line, nothing else — that's all fail2ban
-# needs, and it keeps the file tiny. log_format must live in http context.
-log_format honeypot '$remote_addr';
+# Honeypot log: client IP, timestamp, and the probed request — written only
+# to honeypot.log by the honeypot location. The real timestamp lets fail2ban
+# use a proper date (no datepattern={NONE}), so a log re-scan does not re-ban
+# IPs whose bans already expired.
+log_format honeypot '$remote_addr - [$time_local] "$request"';
 NGINX
 
-write_file "$SNIP_HONEYPOT" 0644 <<'NGINX'
-# Honeypot: log scanner probes for sensitive paths, return 404.
+# honeypot.conf — safe set always; wp-login/phpmyadmin only with --aggressive,
+# since those can be legitimate and would 404+ban real admins otherwise.
+# Built in a variable (not piped into write_file, which would run it in a
+# subshell and lose its CHANGED/TMPFILES bookkeeping).
+honeypot_conf=$(cat <<'NGINX'
+# Honeypot: log probes for paths a real client never requests, then 404.
 # Prefix match (no trailing $) — catches /.git/config, /.env.local, etc.
-# Must be included BEFORE deny-dotfiles.conf so these hits land in honeypot.log.
-location ~* ^/(\.env|\.git|\.aws|\.ssh|wp-login\.php|phpmyadmin|config\.php\.bak|backup\.sql) {
+# Must be included BEFORE deny-dotfiles.conf so these hits get logged first.
+location ~* ^/(\.env|\.git|\.aws|\.ssh|config\.php\.bak|backup\.sql) {
     access_log /var/log/nginx/honeypot.log honeypot;
     return 404;
 }
 NGINX
+)
+if [[ $AGGRESSIVE -eq 1 ]]; then
+    honeypot_conf+='
+
+# Aggressive extras (enabled via --aggressive). Remove if this host ever
+# serves WordPress/phpMyAdmin to real users.
+location ~* ^/(wp-login\.php|phpmyadmin|xmlrpc\.php) {
+    access_log /var/log/nginx/honeypot.log honeypot;
+    return 404;
+}'
+else
+    honeypot_conf+='
+
+# Aggressive extras — paths that CAN be legitimate. Uncomment ONLY if this
+# host does NOT run WordPress/phpMyAdmin (or re-run with --aggressive):
+#location ~* ^/(wp-login\.php|phpmyadmin|xmlrpc\.php) {
+#    access_log /var/log/nginx/honeypot.log honeypot;
+#    return 404;
+#}'
+fi
+write_file "$SNIP_HONEYPOT" 0644 <<<"$honeypot_conf"
 
 write_file "$SNIP_DENY" 0644 <<'NGINX'
-# Block access to dotfiles (.git, .env, .ssh, etc.)
-# Returns 404 instead of 403 so scanners can't confirm file existence.
-# Must be included AFTER honeypot.conf — nginx picks the first matching
-# regex location, and honeypot patterns need to log before this catches them.
-location ~ /\. {
+# Block access to dotfiles (.git, .env, .ssh, …). 404 (not 403) so scanners
+# can't confirm a file exists. The (?!well-known) negative lookahead keeps
+# Let's Encrypt HTTP-01 (/.well-known/acme-challenge/) working.
+# Must be included AFTER honeypot.conf — first matching regex location wins.
+location ~ /\.(?!well-known) {
     return 404;
 }
 NGINX
 
 # Pre-create the log so fail2ban has something to watch from the start.
+# It lives in /var/log/nginx so the distro's existing logrotate covers it.
 if [[ $DRY_RUN -eq 0 && ! -e "$HONEYPOT_LOG" ]]; then
     install -D -m 0640 /dev/null "$HONEYPOT_LOG"
-    if id www-data >/dev/null 2>&1; then chown www-data:adm "$HONEYPOT_LOG" || true; fi
+    id www-data >/dev/null 2>&1 && chown www-data:adm "$HONEYPOT_LOG" 2>/dev/null || true
     ok "created $HONEYPOT_LOG"
 fi
 
-# Sanity: is the honeypot format actually in scope? (Catches the rare case
-# where nginx.conf doesn't include conf.d/*.conf — otherwise the snippet's
-# `access_log … honeypot` would fail nginx -t with a cryptic error.)
-if [[ $DRY_RUN -eq 0 ]] && ! nginx -T 2>/dev/null | grep -Eq 'log_format[[:space:]]+honeypot'; then
-    warn "log_format 'honeypot' isn't visible in the effective config —"
-    warn "your nginx.conf may not include $CONFD_LOG (conf.d/*.conf)."
-    warn "Add this line inside the http { } block manually, then re-run:"
-    warn "    log_format honeypot '\$remote_addr';"
+# Sanity: is the honeypot format actually in scope? Capture nginx -T to a
+# variable first (a `... | grep -q` pipeline would SIGPIPE nginx -T and, under
+# pipefail, look like a failure even when the format IS present).
+if [[ $DRY_RUN -eq 0 ]]; then
+    nginx_dump=$(nginx -T 2>/dev/null || true)
+    if ! grep -Eq 'log_format[[:space:]]+honeypot' <<<"$nginx_dump"; then
+        warn "log_format 'honeypot' isn't visible in the effective config —"
+        warn "your nginx.conf may not include $CONFD_LOG (conf.d/*.conf)."
+        warn "Add this line inside the http { } block manually, then re-run:"
+        warn "    log_format honeypot '\$remote_addr - [\$time_local] \"\$request\"';"
+    fi
 fi
 
 # ── Wire the snippets into every server block ───────────────────────────
 wire_one() {  # $1 = real config file
     local real="$1" tmp
     if grep -q 'snippets/honeypot.conf' "$real"; then info "already wired: $real"; return 0; fi
-    if ! grep -Eq '^[[:space:]]*server[[:space:]]*\{' "$real"; then
-        warn "no server block, skipped: $real"; return 0
+    if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$real"; then
+        warn "contains a stream {} block, skipped (location is invalid there): $real"; return 0
     fi
-    tmp=$(mktemp)
-    awk '
-        /^[[:space:]]*server[[:space:]]*\{/ {
-            print
-            print "    include /etc/nginx/snippets/honeypot.conf;"
-            print "    include /etc/nginx/snippets/deny-dotfiles.conf;"
-            next
-        }
+    if grep -Eq '^[[:space:]]*server[[:space:]]*\{[^}]*\}' "$real"; then
+        warn "one-line server block, skipped (add the includes manually): $real"; return 0
+    fi
+    tmp=$(mktemp); TMPFILES+=("$tmp")
+    # Handles `server {` and Allman-style `server` on its own line then `{`.
+    awk -v inc="    include /etc/nginx/snippets/honeypot.conf;\n    include /etc/nginx/snippets/deny-dotfiles.conf;" '
+        /^[[:space:]]*server[[:space:]]*\{/ { print; print inc; next }
+        /^[[:space:]]*server[[:space:]]*$/  { print; awaiting=1; next }
+        awaiting && /\{/                    { print; print inc; awaiting=0; next }
         { print }
     ' "$real" >"$tmp"
-    if [[ $DRY_RUN -eq 1 ]]; then
-        info "[dry-run] would wire $real"; rm -f "$tmp"; return 0
+    if cmp -s "$tmp" "$real"; then warn "no server block, skipped: $real"; return 0; fi
+    if [[ $DRY_RUN -eq 1 ]]; then info "[dry-run] would wire $real"; return 0; fi
+    do_backup "$real"; CHANGED+=("modified|$real|$REPLY_BACKUP")
+    cat "$tmp" >"$real"
+    ok "wired $real (backup → $REPLY_BACKUP)"
+    if grep -Eq '^[[:space:]]*return[[:space:]]+30[0-9]' "$real"; then
+        warn "↳ $real looks like a redirect vhost — a server-level 'return' runs before"
+        warn "  the honeypot location, so port-80 probes there are 301'd, not trapped"
+        warn "  (they're caught on your HTTPS vhost instead)."
     fi
-    cp -a "$real" "$real.bak.$TS"
-    cat "$tmp" >"$real"; rm -f "$tmp"
-    SITE_BACKUPS+=("$real|$real.bak.$TS")
-    ok "wired $real (backup → $real.bak.$TS)"
 }
 
 if [[ $WIRE -eq 1 ]]; then
@@ -317,8 +411,7 @@ if [[ $WIRE -eq 1 ]]; then
     for f in "$SITES_DIR"/*; do
         real=$(readlink -f "$f" 2>/dev/null || echo "$f")
         [[ -f "$real" ]] || continue
-        found=1
-        wire_one "$real"
+        found=1; wire_one "$real"
     done
     shopt -u nullglob
     [[ $found -eq 0 ]] && warn "no files in $SITES_DIR — nothing to wire."
@@ -327,20 +420,27 @@ else
     printf '    include %s;\n    include %s;\n' "$SNIP_HONEYPOT" "$SNIP_DENY"
 fi
 
-# ── Validate nginx, rolling back site edits on failure ──────────────────
+# ── Validate nginx, rolling back everything we created on failure ────────
+rollback_nginx() {
+    local rec action rest path backup i
+    for (( i=${#CHANGED[@]}-1; i>=0; i-- )); do
+        rec="${CHANGED[$i]}"; action="${rec%%|*}"; rest="${rec#*|}"
+        path="${rest%%|*}"; backup="${rest#*|}"
+        case "$action" in
+            modified) cp -a "$backup" "$path" && warn "restored $path";;
+            created)  rm -f "$path" && warn "removed $path";;
+        esac
+    done
+}
+
 step "nginx -t"
 if [[ $DRY_RUN -eq 1 ]]; then
     info "[dry-run] would run: nginx -t && systemctl reload nginx"
 elif nginx -t; then
-    ok "config valid"
-    run systemctl reload nginx
-    ok "nginx reloaded"
+    ok "config valid"; run systemctl reload nginx; ok "nginx reloaded"
 else
-    err "nginx -t failed — rolling back site edits."
-    for pair in "${SITE_BACKUPS[@]:-}"; do
-        [[ -z "$pair" ]] && continue
-        cp -a "${pair#*|}" "${pair%|*}" && warn "restored ${pair%|*}"
-    done
+    err "nginx -t failed — rolling back everything this script created."
+    rollback_nginx
     if nginx -t; then warn "rolled back to a valid config."; else err "still invalid — inspect manually."; fi
     exit 1
 fi
@@ -349,9 +449,10 @@ fi
 step "fail2ban config"
 
 write_file "$F2B_FILTER" 0644 <<'CONF'
+# honeypot.log lines look like: IP - [time] "METHOD URI"
+# <HOST> = the leading client IP; the [time] is auto-detected by fail2ban.
 [Definition]
-failregex = ^<HOST>
-datepattern = {NONE}
+failregex = ^<HOST> -
 CONF
 
 write_file "$F2B_JAIL" 0644 <<CONF
@@ -368,46 +469,62 @@ bantime.maxtime   = $MAXTIME
 ignoreip  = $IGNOREIP
 CONF
 
-# Global whitelist for ALL jails (incl. sshd): only create jail.local if it
-# doesn't already exist, so we never clobber an existing fail2ban setup.
+# Global whitelist for ALL jails (incl. sshd). Only the ignoreip goes into
+# [DEFAULT]; banaction stays scoped to our jail so we don't silently change
+# how other jails (e.g. sshd) ban. Created only if jail.local is absent.
 if [[ ! -e "$F2B_JAIL_LOCAL" ]]; then
     write_file "$F2B_JAIL_LOCAL" 0644 <<CONF
 [DEFAULT]
-banaction = nftables-allports
-ignoreip  = $IGNOREIP
+ignoreip = $IGNOREIP
 CONF
 else
     warn "$F2B_JAIL_LOCAL exists — left untouched."
-    warn "For a global whitelist, make sure its [DEFAULT] ignoreip includes:"
+    warn "For a global whitelist, ensure its [DEFAULT] ignoreip includes:"
     warn "    $IGNOREIP"
 fi
 
 [[ -e /etc/fail2ban/action.d/nftables-allports.conf ]] || \
-    warn "action 'nftables-allports' not found — your fail2ban may be too old."
+    warn "action 'nftables-allports' not found — your fail2ban may be too old (need >= 0.11.2)."
 
-# ── Start / reload fail2ban ─────────────────────────────────────────────
+# ── Start / reload fail2ban, then VERIFY the jail actually loaded ───────
 step "Starting fail2ban"
 if [[ $DRY_RUN -eq 1 ]]; then
-    info "[dry-run] would: systemctl enable --now fail2ban && fail2ban-client reload"
+    info "[dry-run] would: systemctl enable --now fail2ban && fail2ban-client reload && verify jail"
 else
     run systemctl enable --now fail2ban
     if ! systemctl reload fail2ban 2>/dev/null && ! fail2ban-client reload 2>/dev/null; then
         run systemctl restart fail2ban
     fi
-    ok "fail2ban running"
+    if fail2ban-client status nginx-honeypot >/dev/null 2>&1; then
+        ok "jail nginx-honeypot is loaded"
+    else
+        err "jail nginx-honeypot did NOT load — the honeypot will log but never ban."
+        err "Check: sudo fail2ban-client status   and   sudo journalctl -u fail2ban -n 50"
+        exit 1
+    fi
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────
 step "Done"
 if [[ $DRY_RUN -eq 1 ]]; then
-    info "Dry run complete. Re-run without --dry-run to apply."
-    exit 0
+    info "Dry run complete. Re-run without --dry-run to apply."; exit 0
+fi
+if [[ $WIRE -eq 0 ]]; then
+    cat <<DONE
+  ${C_YEL}Snippets and the fail2ban jail are installed, but NOT wired into any
+  server block (--no-wire).${C_0} The honeypot is INACTIVE until you add:
+    include $SNIP_HONEYPOT;
+    include $SNIP_DENY;
+  to each server { } block, then: sudo nginx -t && sudo systemctl reload nginx
+DONE
+else
+    cat <<DONE
+  ${C_GRN}Honeypot is live.${C_0} A probe to /.env, /.git, … gets one 404; its IP,
+  the time, and the request land in $HONEYPOT_LOG, and fail2ban bans it on all
+  ports. Whitelisted (never banned): ${C_B}$IGNOREIP${C_0}
+DONE
 fi
 cat <<DONE
-  ${C_GRN}Honeypot is live.${C_0} Scanners hitting /.env, /.git, /wp-login.php… get
-  one 404, their IP lands in $HONEYPOT_LOG, and fail2ban bans them on all ports.
-
-  Whitelisted (won't be banned): ${C_B}$IGNOREIP${C_0}
 
   Check it:
     sudo fail2ban-client status nginx-honeypot
@@ -416,4 +533,3 @@ cat <<DONE
     sudo fail2ban-client set nginx-honeypot unbanip <IP>
     sudo fail2ban-client unban --all
 DONE
-fail2ban-client status nginx-honeypot 2>/dev/null || true
