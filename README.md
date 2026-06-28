@@ -44,6 +44,25 @@ less setup-honeypot.sh         # read it
 sudo bash setup-honeypot.sh    # interactive: confirms your IP, asks for extras
 ```
 
+Verify the download matches the published checksum before reading and running it
+(MD5 / SHA-256 of the current `main`):
+
+```bash
+md5sum setup-honeypot.sh
+# expected: 6447f7bafd06922de5631ceb5238394e  setup-honeypot.sh
+
+# or check in one step (prints "setup-honeypot.sh: OK"):
+echo "6447f7bafd06922de5631ceb5238394e  setup-honeypot.sh" | md5sum -c -
+
+# SHA-256 (stronger):
+sha256sum setup-honeypot.sh
+# expected: 0cd029a738716f7b4b988125c54451c9fe78c9d8d63ac525ee0e018469a9ef0b  setup-honeypot.sh
+```
+
+> The checksums pin the current `main` and change whenever the script does. A
+> hash served from the same repo only catches transport corruption, not a
+> tampered repo — so still read the script before running it.
+
 Preview without changing anything:
 
 ```bash
