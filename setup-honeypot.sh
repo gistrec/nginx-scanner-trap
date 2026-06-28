@@ -461,6 +461,11 @@ write_file "$F2B_JAIL" 0644 <<CONF
 enabled   = true
 filter    = nginx-honeypot
 logpath   = $HONEYPOT_LOG
+# Force a file backend. The distro default is often 'systemd' (it is on
+# Debian/Ubuntu), which makes the jail read the journal and miss this
+# file-based honeypot log entirely — 0 hits, 0 bans. 'auto' picks
+# pyinotify/polling on the file and never resolves to systemd.
+backend   = auto
 maxretry  = 1
 bantime   = $BANTIME
 banaction = nftables-allports
@@ -489,19 +494,46 @@ fi
 # ── Start / reload fail2ban, then VERIFY the jail actually loaded ───────
 step "Starting fail2ban"
 if [[ $DRY_RUN -eq 1 ]]; then
-    info "[dry-run] would: systemctl enable --now fail2ban && fail2ban-client reload && verify jail"
+    info "[dry-run] would: systemctl enable --now fail2ban && fail2ban-client reload && verify jail watches the log file"
 else
     run systemctl enable --now fail2ban
     if ! systemctl reload fail2ban 2>/dev/null && ! fail2ban-client reload 2>/dev/null; then
         run systemctl restart fail2ban
     fi
-    if fail2ban-client status nginx-honeypot >/dev/null 2>&1; then
-        ok "jail nginx-honeypot is loaded"
-    else
+    # Pull the jail status (retry: right after a restart the server socket can
+    # need a moment before it answers).
+    jail_status=""
+    for _ in 1 2 3 4 5; do
+        jail_status=$(fail2ban-client status nginx-honeypot 2>/dev/null) || jail_status=""
+        if [[ -n "$jail_status" ]]; then break; fi
+        sleep 1
+    done
+
+    if [[ -z "$jail_status" ]]; then
         err "jail nginx-honeypot did NOT load — the honeypot will log but never ban."
         err "Check: sudo fail2ban-client status   and   sudo journalctl -u fail2ban -n 50"
         exit 1
     fi
+    ok "jail nginx-honeypot is loaded"
+
+    # Loaded isn't enough: the jail must WATCH THE FILE, not the systemd
+    # journal. If the distro default backend is 'systemd' (it is on
+    # Debian/Ubuntu) and the jail doesn't override it, fail2ban reads the
+    # journal and silently ignores this file-based log — probes get logged,
+    # but 'Total failed' stays 0 and nothing is ever banned. The honeypot log
+    # must show up in the jail's monitored "File list".
+    if ! grep -qF "$HONEYPOT_LOG" <<<"$jail_status"; then
+        err "jail nginx-honeypot is NOT watching $HONEYPOT_LOG — it will log but never ban."
+        if grep -q 'Journal matches:' <<<"$jail_status"; then
+            err "It's on the systemd backend (reading the journal), so file-based"
+            err "honeypot hits are invisible to it."
+        fi
+        err "Fix: ensure 'backend = auto' is set in $F2B_JAIL, then restart fail2ban."
+        err "Verify: sudo fail2ban-client status nginx-honeypot"
+        err "        → expect 'File list: $HONEYPOT_LOG'"
+        exit 1
+    fi
+    ok "jail nginx-honeypot is watching $HONEYPOT_LOG (file backend)"
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────
