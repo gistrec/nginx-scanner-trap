@@ -1,5 +1,7 @@
 # nginx-scanner-trap
 
+**English** · [Русский](README.ru.md)
+
 Turn an nginx box into a honeypot for vulnerability scanners — and ban them
 automatically with **fail2ban + nftables**. One script, works out of the box.
 
@@ -9,8 +11,9 @@ wasted load and noise that buries real 404s in your alerts. `setup-honeypot.sh`
 makes the **first** such request cost the bot its access to the whole host.
 
 > Full write-up — the why and the how, step by step:
-> · **English** — https://gistrec.cloud/blog/nginx-honeypot-fail2ban/
-> · **Русский** — https://gistrec.cloud/blog/nginx-honeypot-fail2ban/ru/
+>
+> - **English** — https://gistrec.cloud/blog/nginx-honeypot-fail2ban/
+> - **Русский** — https://gistrec.cloud/blog/nginx-honeypot-fail2ban/ru/
 
 ## What it does
 
