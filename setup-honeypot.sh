@@ -115,8 +115,10 @@ detect_admin_ip() {
         ip=$(who am i 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p')
     fi
     if [[ -z "$ip" ]] && command -v ss >/dev/null 2>&1; then
+        # $3 = local address — anchor on OUR :22, so an outgoing ssh session
+        # from this box (peer :22) can't donate a foreign IP to the whitelist.
         ip=$(ss -tnHo state established 2>/dev/null \
-             | awk '$0 ~ /:22 /{print $4}' \
+             | awk '$3 ~ /:22$/{print $4}' \
              | sed -E 's/.*:([0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]+$/\1/; s/[][]//g' \
              | head -n1)
     fi
@@ -255,11 +257,14 @@ fi
 
 IGNORE_LIST=(127.0.0.1/8 ::1)
 admin_count=0
+set -f  # word-split is intended here; -f keeps a typo like 1.2.3.* from
+        # globbing into filenames from the cwd
 for cand in $ADMIN_IP $EXTRA_IPS; do
     [[ -z "$cand" ]] && continue
     if valid_ip "$cand"; then IGNORE_LIST+=("$cand"); admin_count=$((admin_count + 1))
     else warn "skipping invalid: $cand"; fi
 done
+set +f
 IGNOREIP=$(printf '%s\n' "${IGNORE_LIST[@]}" | awk '!seen[$0]++' | paste -sd' ' -)
 
 if [[ $admin_count -eq 0 ]]; then
@@ -377,7 +382,9 @@ fi
 # ── Wire the snippets into every server block ───────────────────────────
 wire_one() {  # $1 = real config file
     local real="$1" tmp
-    if grep -q 'snippets/honeypot.conf' "$real"; then info "already wired: $real"; return 0; fi
+    if grep -q 'snippets/honeypot.conf' "$real"; then
+        info "already wired: $real"; wired_count=$((wired_count + 1)); return 0
+    fi
     if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$real"; then
         warn "contains a stream {} block, skipped (location is invalid there): $real"; return 0
     fi
@@ -393,9 +400,12 @@ wire_one() {  # $1 = real config file
         { print }
     ' "$real" >"$tmp"
     if cmp -s "$tmp" "$real"; then warn "no server block, skipped: $real"; return 0; fi
-    if [[ $DRY_RUN -eq 1 ]]; then info "[dry-run] would wire $real"; return 0; fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+        info "[dry-run] would wire $real"; wired_count=$((wired_count + 1)); return 0
+    fi
     do_backup "$real"; CHANGED+=("modified|$real|$REPLY_BACKUP")
     cat "$tmp" >"$real"
+    wired_count=$((wired_count + 1))
     ok "wired $real (backup → $REPLY_BACKUP)"
     if grep -Eq '^[[:space:]]*return[[:space:]]+30[0-9]' "$real"; then
         warn "↳ $real looks like a redirect vhost — a server-level 'return' runs before"
@@ -404,6 +414,7 @@ wire_one() {  # $1 = real config file
     fi
 }
 
+wired_count=0
 if [[ $WIRE -eq 1 ]]; then
     step "Wiring snippets into $SITES_DIR/*"
     shopt -s nullglob
@@ -488,8 +499,22 @@ else
     warn "    $IGNOREIP"
 fi
 
-[[ -e /etc/fail2ban/action.d/nftables-allports.conf ]] || \
-    warn "action 'nftables-allports' not found — your fail2ban may be too old (need >= 0.11.2)."
+[[ -e /etc/fail2ban/action.d/nftables-allports.conf ]] || {
+    warn "action 'nftables-allports' not found in /etc/fail2ban/action.d —"
+    warn "this fail2ban build has no nftables actions; the jail will fail to load."
+}
+
+# bantime.increment / bantime.maxtime need fail2ban >= 0.11 — older versions
+# ignore the keys, so every ban would last the fixed base bantime. Say so
+# instead of guessing at versions (the jail itself still works).
+f2b_ver=""
+if command -v fail2ban-client >/dev/null 2>&1; then
+    f2b_ver=$(fail2ban-client --version 2>/dev/null | grep -Eom1 '[0-9]+(\.[0-9]+)+' || true)
+fi
+if [[ -n "$f2b_ver" && "$(printf '%s\n' "$f2b_ver" 0.11 | sort -V | head -n1)" != "0.11" ]]; then
+    warn "fail2ban $f2b_ver < 0.11: incremental bans (bantime.increment/maxtime)"
+    warn "aren't supported and are ignored — every ban lasts bantime=$BANTIME."
+fi
 
 # ── Start / reload fail2ban, then VERIFY the jail actually loaded ───────
 step "Starting fail2ban"
@@ -549,11 +574,21 @@ if [[ $WIRE -eq 0 ]]; then
     include $SNIP_DENY;
   to each server { } block, then: sudo nginx -t && sudo systemctl reload nginx
 DONE
+elif [[ $wired_count -eq 0 ]]; then
+    cat <<DONE
+  ${C_YEL}Snippets and the fail2ban jail are installed, but NO server block got
+  the includes${C_0} — $SITES_DIR is empty or every file was skipped (see
+  warnings above). The honeypot is INACTIVE until you add:
+    include $SNIP_HONEYPOT;
+    include $SNIP_DENY;
+  to each server { } block, then: sudo nginx -t && sudo systemctl reload nginx
+DONE
 else
     cat <<DONE
-  ${C_GRN}Honeypot is live.${C_0} A probe to /.env, /.git, … gets one 404; its IP,
-  the time, and the request land in $HONEYPOT_LOG, and fail2ban bans it on all
-  ports. Whitelisted (never banned): ${C_B}$IGNOREIP${C_0}
+  ${C_GRN}Honeypot is live${C_0} — wired into $wired_count file(s) in $SITES_DIR.
+  A probe to /.env, /.git, … gets one 404; its IP, the time, and the request
+  land in $HONEYPOT_LOG, and fail2ban bans it on all ports.
+  Whitelisted (never banned): ${C_B}$IGNOREIP${C_0}
 DONE
 fi
 cat <<DONE

@@ -21,8 +21,8 @@ makes the **first** such request cost the bot its access to the whole host.
   probed request line (http context) — so you can see *what* was hit.
 - `honeypot.conf` — logs probes of paths a real client never requests (`/.env`,
   `/.git`, `/.aws`, `/.ssh`, `config.php.bak`, `backup.sql`) to a dedicated log
-  and returns 404. `wp-login.php`/`phpmyadmin` are opt-in via `--aggressive`
-  (they can be legitimate on WordPress/phpMyAdmin hosts).
+  and returns 404. `wp-login.php`/`xmlrpc.php`/`phpmyadmin` are opt-in via
+  `--aggressive` (they can be legitimate on WordPress/phpMyAdmin hosts).
 - `deny-dotfiles.conf` — 404 for any other dotfile, but keeps
   `/.well-known/acme-challenge/` working so Let's Encrypt renewals don't break.
 - Wires both snippets into every `server { }` in `sites-enabled/` (idempotent;
@@ -52,19 +52,20 @@ Verify the download matches the published checksum before reading and running it
 
 ```bash
 md5sum setup-honeypot.sh
-# expected: 6447f7bafd06922de5631ceb5238394e  setup-honeypot.sh
+# expected: 44bf75163b9bf91c7ba39ce9c7483c55  setup-honeypot.sh
 
 # or check in one step (prints "setup-honeypot.sh: OK"):
-echo "6447f7bafd06922de5631ceb5238394e  setup-honeypot.sh" | md5sum -c -
+echo "44bf75163b9bf91c7ba39ce9c7483c55  setup-honeypot.sh" | md5sum -c -
 
 # SHA-256 (stronger):
 sha256sum setup-honeypot.sh
-# expected: 0cd029a738716f7b4b988125c54451c9fe78c9d8d63ac525ee0e018469a9ef0b  setup-honeypot.sh
+# expected: 6d0246475ee6eab454b5ab5aa03753f9a82d25c9eb378f18db31afc8ddbe9bdd  setup-honeypot.sh
 ```
 
-> The checksums pin the current `main` and change whenever the script does. A
-> hash served from the same repo only catches transport corruption, not a
-> tampered repo — so still read the script before running it.
+> The checksums pin the current `main` and change whenever the script does —
+> CI fails if the published sums don't match the script. A hash served from the
+> same repo only catches transport corruption, not a tampered repo — so still
+> read the script before running it.
 
 Preview without changing anything:
 

@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pin shellcheck so CI matches local runs (ubuntu-latest's bundled
+      # version drifts and flags different advisory checks over time).
+      - name: Install ShellCheck v0.11.0
+        run: |
+          ver=v0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${ver}/shellcheck-${ver}.linux.x86_64.tar.xz" | tar -xJ
+          sudo install "shellcheck-${ver}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+      - name: Run ShellCheck
+        run: shellcheck setup-honeypot.sh
+
+  # Both READMEs publish MD5/SHA-256 sums of setup-honeypot.sh for the
+  # verify-before-run step. Hand-maintained sums rot on the first forgotten
+  # update — and a stale published sum breaks verification for every reader.
+  checksums:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: READMEs carry the current checksums
+        run: |
+          md5=$(md5sum setup-honeypot.sh | awk '{print $1}')
+          sha=$(sha256sum setup-honeypot.sh | awk '{print $1}')
+          rc=0
+          for f in README.md README.ru.md; do
+            grep -qF "$md5" "$f" || { echo "::error file=$f::stale MD5 — update to: $md5"; rc=1; }
+            grep -qF "$sha" "$f" || { echo "::error file=$f::stale SHA-256 — update to: $sha"; rc=1; }
+          done
+          exit $rc
